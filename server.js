@@ -210,6 +210,28 @@ async function getAggregatedVideos({ handle }) {
   return data;
 }
 
+// Root endpoint
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'Sport Rays API',
+    version: '1.0.0',
+    status: 'running',
+    endpoints: {
+      health: '/health',
+      videos: '/videos?handle=@premierleague (optional)',
+      channels: '/channels',
+      news: '/news',
+      scores: '/scores?scope=live|today|upcoming',
+      polls: {
+        active: '/polls/active',
+        vote: 'POST /polls/:id/vote',
+        results: '/polls/:id/results'
+      },
+      admin: '/admin (requires secret)'
+    }
+  });
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.get('/videos', async (req, res) => {
