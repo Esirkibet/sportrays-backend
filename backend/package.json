@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "sportrays-backend": "file:.."
+  }
+}

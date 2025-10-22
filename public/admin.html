@@ -1,0 +1,109 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sport Rays Admin</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; background: #0b0b0b; color: #eee; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    input, textarea, button, select { padding: 8px; border-radius: 6px; border: 1px solid #333; background: #111; color: #eee; }
+    button { cursor: pointer; background: #1f6feb; border: none; }
+    button.secondary { background: #333; }
+    .card { border: 1px solid #222; border-radius: 8px; padding: 12px; margin: 12px 0; }
+    .muted { opacity: .8; }
+    .list { margin-top: 16px; }
+    .col { display: flex; flex-direction: column; gap: 8px; }
+    .danger { background: #b42318; }
+  </style>
+</head>
+<body>
+  <h1>Sport Rays Admin</h1>
+  <div class="row">
+    <label for="secret">Admin Secret:</label>
+    <input id="secret" type="password" placeholder="Enter ADMIN_SECRET" />
+    <button id="load">Load Polls</button>
+  </div>
+
+  <h2>Create Poll</h2>
+  <div class="col">
+    <input id="q" placeholder="Question" />
+    <input id="startsAt" type="datetime-local" />
+    <input id="endsAt" type="datetime-local" />
+    <input id="options" placeholder="Options (comma-separated)" />
+    <label class="row"><input id="isActive" type="checkbox" /> Active</label>
+    <button id="create">Create</button>
+  </div>
+
+  <h2>Polls</h2>
+  <div id="list" class="list"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const api = (path, method = 'GET', body) => {
+      const secret = $('secret').value.trim();
+      const headers = { 'Content-Type': 'application/json', 'x-admin-secret': secret };
+      return fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined }).then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.headers.get('content-type')?.includes('json') ? r.json() : r.text();
+      });
+    };
+
+    function renderPolls(items) {
+      const container = $('list');
+      container.innerHTML = '';
+      for (const p of items) {
+        const el = document.createElement('div');
+        el.className = 'card';
+        el.innerHTML = `
+          <div class="row" style="justify-content:space-between;align-items:center;">
+            <div>
+              <div><strong>${p.question}</strong></div>
+              <div class="muted">${p.starts_at} → ${p.ends_at}</div>
+              <div class="muted">Active: ${p.is_active ? 'Yes' : 'No'}</div>
+              <div class="muted">ID: ${p.id}</div>
+            </div>
+            <div class="row">
+              <button class="secondary" data-act="activate" data-id="${p.id}">Activate</button>
+              <button class="secondary" data-act="deactivate" data-id="${p.id}">Deactivate</button>
+            </div>
+          </div>`;
+        container.appendChild(el);
+      }
+      container.querySelectorAll('button[data-act]').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          const id = e.target.getAttribute('data-id');
+          const act = e.target.getAttribute('data-act');
+          try {
+            await api(`/admin/polls/${id}/${act}`, 'POST');
+            await loadPolls();
+            alert('OK');
+          } catch (err) { alert('Failed: ' + err.message); }
+        });
+      });
+    }
+
+    async function loadPolls() {
+      try {
+        const data = await api('/admin/polls');
+        renderPolls(data.items || []);
+      } catch (e) { alert('Failed to load polls: ' + e.message); }
+    }
+
+    $('load').addEventListener('click', loadPolls);
+
+    $('create').addEventListener('click', async () => {
+      const question = $('q').value.trim();
+      const startsAt = new Date($('startsAt').value).toISOString();
+      const endsAt = new Date($('endsAt').value).toISOString();
+      const options = $('options').value.split(',').map(s => s.trim()).filter(Boolean);
+      const isActive = $('isActive').checked;
+      try {
+        await api('/admin/polls', 'POST', { question, startsAt, endsAt, isActive, options });
+        await loadPolls();
+        alert('Created');
+      } catch (e) { alert('Failed: ' + e.message); }
+    });
+  </script>
+</body>
+</html>
