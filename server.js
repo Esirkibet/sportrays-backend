@@ -1,6 +1,12 @@
  
 
+const crypto = require('crypto');
 const express = require('express');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const { body, query, param, validationResult } = require('express-validator');
+const morgan = require('morgan');
 const cors = require('cors');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
@@ -9,9 +15,52 @@ const Parser = require('rss-parser');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: false,  // Allow inline scripts for admin panel
+  crossOriginEmbedderPolicy: false
+}));
+app.use(compression());
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+
+// CORS - restrict to your domain in production
+const corsOptions = {
+  origin: process.env.NODE_ENV === 'production'
+    ? ['https://sportrays-backend.onrender.com', /\.sportrays\./]
+    : '*',
+  credentials: true,
+  maxAge: 86400
+};
+app.use(cors(corsOptions));
+
+// Body parsing with size limits
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+
+// Static files
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Trust proxy (required for rate limiting behind Render/Heroku)
+app.set('trust proxy', 1);
+
+// Rate limiting
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20, // stricter limit for write operations
+  message: { error: 'Too many requests, please try again later.' }
+});
+
+app.use('/api/', generalLimiter); // Apply to all API routes
+app.use('/polls/:id/vote', strictLimiter); // Stricter limit for voting
 
 const PORT = process.env.PORT || 3001;
 const YT_KEY = process.env.YOUTUBE_API_KEY;
@@ -33,9 +82,35 @@ const supabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
   : null;
 
+// Async error wrapper
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+// Validation error handler
+const handleValidation = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
+  }
+  next();
+};
+
+// Admin authentication with rate limiting protection
 function requireAdmin(req, res, next) {
   const token = req.headers['x-admin-secret'] || req.query.secret;
-  if (!ADMIN_SECRET || token !== ADMIN_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+  if (!ADMIN_SECRET) {
+    return res.status(503).json({ error: 'Admin功能 temporarily unavailable' });
+  }
+  // Use constant-time comparison to prevent timing attacks
+  const tokenBuffer = Buffer.from(token || '', 'utf8');
+  const secretBuffer = Buffer.from(ADMIN_SECRET, 'utf8');
+  const match = tokenBuffer.length === secretBuffer.length &&
+    crypto.timingSafeEqual(tokenBuffer, secretBuffer);
+  if (!match) {
+    // Add small delay to slow down brute force
+    return setTimeout(() => res.status(401).json({ error: 'Unauthorized' }), 1000);
+  }
   next();
 }
 
@@ -96,21 +171,38 @@ async function getChannelsList() {
     }
   }
   const data = { items: list };
-  cache.channelsList = { data, expires: now() + TEN_MIN };
+  cache.channelsList = { data, expires: now() + TTL_CHANNELS };
   return data;
 }
 
+// Increased cache TTLs to reduce API quota usage
+const ONE_HOUR = 60 * 60 * 1000;
 const TEN_MIN = 10 * 60 * 1000;
-const TTL_LIVE = 45 * 1000; // 30–60s
+const TTL_VIDEOS = 30 * 60 * 1000; // 30 minutes (was 10)
+const TTL_CHANNELS = 60 * 60 * 1000; // 1 hour (was 10 min)
+const TTL_NEWS = 15 * 60 * 1000; // 15 minutes
+const TTL_LIVE = 45 * 1000;
 const TTL_TODAY = 60 * 1000;
 const TTL_UPCOMING = 5 * 60 * 1000;
 
 function now() { return Date.now(); }
 
-async function fetchJson(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Fetch failed ${res.status}`);
-  return res.json();
+async function fetchJson(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeout || 10000);
+  try {
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err.name === 'AbortError') throw new Error('Request timeout');
+    throw err;
+  }
 }
 
 async function resolveChannelIdFromHandle(handle) {
@@ -183,7 +275,7 @@ async function getAggregatedVideos({ handle }) {
     const vids = await fetchRecentVideosForChannel(channelId, 12);
     const sorted = vids.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
     const data = { items: sorted, nextCursor: null };
-    cache.videosByHandle.set(key, { data, expires: now() + TEN_MIN });
+    cache.videosByHandle.set(key, { data, expires: now() + TTL_VIDEOS });
     return data;
   }
 
@@ -206,7 +298,7 @@ async function getAggregatedVideos({ handle }) {
   merged.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
   const limited = merged.slice(0, 60);
   const data = { items: limited, nextCursor: null };
-  cache.videosAll = { data, expires: now() + TEN_MIN };
+  cache.videosAll = { data, expires: now() + TTL_VIDEOS };
   return data;
 }
 
@@ -234,17 +326,41 @@ app.get('/', (_req, res) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-app.get('/videos', async (req, res) => {
+// Debug endpoint (remove in production)
+app.get('/debug/youtube', asyncHandler(async (req, res) => {
+  if (!YT_KEY) return res.status(500).json({ error: 'No YouTube API key' });
+  try {
+    // Test basic YouTube API call
+    const testUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=1&q=@premierleague&key=${YT_KEY}`;
+    const result = await fetchJson(testUrl);
+    res.json({ 
+      success: true, 
+      quota: 'API responding',
+      channelFound: result.items?.length > 0,
+      result 
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      error: err.message,
+      suggestion: 'Check YouTube API key and quota at https://console.cloud.google.com/apis/api/youtube.googleapis.com'
+    });
+  }
+}));
+
+app.get('/videos', [
+  query('handle').optional().isString().trim().isLength({ max: 100 }),
+  handleValidation
+], asyncHandler(async (req, res) => {
   try {
     if (!YT_KEY) return res.status(500).json({ error: 'Server missing YOUTUBE_API_KEY' });
     const handle = req.query.handle;
     const data = await getAggregatedVideos({ handle });
     res.json(data);
   } catch (e) {
-    console.error(e);
+    console.error('Videos error:', e.message);
     res.status(500).json({ error: 'Failed to fetch videos' });
   }
-});
+}));
 
 app.get('/channels', async (_req, res) => {
   try {
@@ -339,7 +455,7 @@ async function aggregateNews() {
   unique.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
   const limited = unique.slice(0, 150);
   const data = { items: limited, nextCursor: null };
-  cache.newsAll = { data, expires: now() + TEN_MIN };
+  cache.newsAll = { data, expires: now() + TTL_NEWS };
   return data;
 }
 
@@ -457,17 +573,20 @@ async function getScores(scope) {
   return data;
 }
 
-app.get('/scores', async (req, res) => {
+app.get('/scores', [
+  query('scope').optional().isIn(['live', 'today', 'upcoming']),
+  handleValidation
+], asyncHandler(async (req, res) => {
   try {
     const scope = (req.query.scope || 'live').toString();
     if (!['live', 'today', 'upcoming'].includes(scope)) return res.status(400).json({ error: 'bad scope' });
     const data = await getScores(scope);
     res.json(data);
   } catch (e) {
-    console.error(e);
+    console.error('Scores error:', e.message);
     res.status(500).json({ error: 'Failed to fetch scores' });
   }
-});
+}));
 
 // Minimal admin endpoints for polls (secured by ADMIN_SECRET)
 app.get('/admin', requireAdmin, (_req, res) => {
@@ -579,7 +698,12 @@ app.get('/polls/active', async (req, res) => {
   }
 });
 
-app.post('/polls/:id/vote', async (req, res) => {
+app.post('/polls/:id/vote', [
+  param('id').isUUID(),
+  body('optionId').isUUID(),
+  body('deviceIdHash').isString().isLength({ min: 32, max: 128 }),
+  handleValidation
+], asyncHandler(async (req, res) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Polls not configured' });
     const pollId = req.params.id;
@@ -617,8 +741,42 @@ app.post('/polls/:id/vote', async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Failed to vote' });
   }
+}));
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
 });
 
-app.listen(PORT, () => {
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  const status = err.status || err.statusCode || 500;
+  const message = process.env.NODE_ENV === 'production'
+    ? 'Internal server error'
+    : err.message;
+  res.status(status).json({ error: message });
+});
+
+// Start server
+const server = app.listen(PORT, () => {
   console.log(`Sport Rays backend listening on http://localhost:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('\nSIGINT signal received: closing HTTP server');
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
 });
