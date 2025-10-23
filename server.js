@@ -148,12 +148,23 @@ const cache = {
 };
 
 async function fetchChannelDetails(channelId) {
-  const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet&id=${channelId}&key=${YT_KEY}`;
-  const json = await fetchJson(url);
-  const item = json.items?.[0];
-  const title = item?.snippet?.title;
-  const avatar = item?.snippet?.thumbnails?.default?.url || null;
-  return { title, avatar };
+  if (!canMakeApiCall('channels')) {
+    throw new Error('YouTube API quota limit reached for channel details');
+  }
+  
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet&id=${channelId}&key=${YT_KEY}`;
+    const json = await fetchJson(url);
+    recordQuotaUsage('channels');
+    
+    const item = json.items?.[0];
+    const title = item?.snippet?.title;
+    const avatar = item?.snippet?.thumbnails?.default?.url || null;
+    return { title, avatar };
+  } catch (e) {
+    console.error('Failed to fetch channel details:', e.message);
+    throw e;
+  }
 }
 
 async function getChannelsList() {
@@ -175,11 +186,12 @@ async function getChannelsList() {
   return data;
 }
 
-// Increased cache TTLs to reduce API quota usage
+// Smart cache TTLs with quota-aware management
 const ONE_HOUR = 60 * 60 * 1000;
 const TEN_MIN = 10 * 60 * 1000;
-const TTL_VIDEOS = 30 * 60 * 1000; // 30 minutes (was 10)
-const TTL_CHANNELS = 60 * 60 * 1000; // 1 hour (was 10 min)
+const TTL_VIDEOS = 48 * 60 * 60 * 1000; // 48 hours (increased from 24)
+const TTL_CHANNELS = 12 * 60 * 60 * 1000; // 12 hours (increased from 6)
+const TTL_CHANNEL_ID = 7 * 24 * 60 * 60 * 1000; // 1 week for channel ID resolution
 const TTL_NEWS = 15 * 60 * 1000; // 15 minutes
 const TTL_LIVE = 45 * 1000;
 const TTL_TODAY = 60 * 1000;
@@ -210,14 +222,32 @@ async function resolveChannelIdFromHandle(handle) {
   const entry = cache.channelIdByHandle.get(key);
   if (entry && entry.expires > now()) return entry.id;
 
-  // Try YouTube search to find the channel ID by handle
-  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=1&q=${encodeURIComponent(handle)}&key=${YT_KEY}`;
-  const json = await fetchJson(url);
-  const item = json.items?.[0];
-  const channelId = item?.id?.channelId;
-  if (!channelId) throw new Error(`Cannot resolve channel for handle ${handle}`);
-  cache.channelIdByHandle.set(key, { id: channelId, expires: now() + 7 * 24 * 60 * 60 * 1000 });
-  return channelId;
+  if (!canMakeApiCall('search')) {
+    console.warn(`Cannot resolve channel ${handle} - quota limit reached`);
+    if (entry && entry.id) return entry.id; // Use stale data
+    throw new Error(`Cannot resolve channel ${handle} - quota limit reached`);
+  }
+
+  try {
+    // Try YouTube search to find the channel ID by handle
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=1&q=${encodeURIComponent(handle)}&key=${YT_KEY}`;
+    const json = await fetchJson(url);
+    recordQuotaUsage('search');
+    
+    const item = json.items?.[0];
+    const channelId = item?.id?.channelId;
+    if (!channelId) throw new Error(`Cannot resolve channel for handle ${handle}`);
+    cache.channelIdByHandle.set(key, { id: channelId, expires: now() + TTL_CHANNEL_ID });
+    return channelId;
+  } catch (e) {
+    console.error(`Failed to resolve channel ${handle}:`, e.message);
+    // Return stale data if available
+    if (entry && entry.id) {
+      console.warn(`Using stale channel ID for ${handle}`);
+      return entry.id;
+    }
+    throw e;
+  }
 }
 
 function isoDurationToSeconds(iso) {
@@ -230,39 +260,81 @@ function isoDurationToSeconds(iso) {
 }
 
 async function fetchRecentVideosForChannel(channelId, maxResults = 10) {
-  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&maxResults=${maxResults}&order=date&type=video&key=${YT_KEY}`;
-  const json = await fetchJson(url);
-  const items = json.items || [];
-  const ids = items.map((it) => it.id?.videoId).filter(Boolean);
-  if (!ids.length) return [];
+  if (!canMakeApiCall('search') || !canMakeApiCall('videos')) {
+    throw new Error('YouTube API quota limit reached');
+  }
 
-  // Fetch details for durations and better thumbnails
-  const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=${ids.join(',')}&key=${YT_KEY}`;
-  const detailsJson = await fetchJson(detailsUrl);
-  const byId = new Map(detailsJson.items.map((it) => [it.id, it]));
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&maxResults=${maxResults}&order=date&type=video&key=${YT_KEY}`;
+    const json = await fetchJson(url);
+    recordQuotaUsage('search');
+    
+    const items = json.items || [];
+    const ids = items.map((it) => it.id?.videoId).filter(Boolean);
+    if (!ids.length) return [];
 
-  return ids
-    .map((id) => {
-      const d = byId.get(id);
-      if (!d) return null;
-      return {
-        id,
-        url: `https://www.youtube.com/watch?v=${id}`,
-        title: d.snippet?.title,
-        channel: {
-          id: d.snippet?.channelId,
-          name: d.snippet?.channelTitle,
-          avatar: null,
-        },
-        thumbnails: {
-          sm: d.snippet?.thumbnails?.medium?.url || d.snippet?.thumbnails?.default?.url,
-          md: d.snippet?.thumbnails?.high?.url || d.snippet?.thumbnails?.medium?.url,
-        },
-        durationSec: isoDurationToSeconds(d.contentDetails?.duration),
-        publishedAt: d.snippet?.publishedAt,
-      };
-    })
-    .filter(Boolean);
+    // Fetch details for durations and better thumbnails
+    const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=${ids.join(',')}&key=${YT_KEY}`;
+    const detailsJson = await fetchJson(detailsUrl);
+    recordQuotaUsage('videos');
+    
+    const byId = new Map(detailsJson.items.map((it) => [it.id, it]));
+
+    return ids
+      .map((id) => {
+        const d = byId.get(id);
+        if (!d) return null;
+        return {
+          id,
+          url: `https://www.youtube.com/watch?v=${id}`,
+          title: d.snippet?.title,
+          channel: {
+            id: d.snippet?.channelId,
+            name: d.snippet?.channelTitle,
+            avatar: null,
+          },
+          thumbnails: {
+            sm: d.snippet?.thumbnails?.medium?.url || d.snippet?.thumbnails?.default?.url,
+            md: d.snippet?.thumbnails?.high?.url || d.snippet?.thumbnails?.medium?.url,
+          },
+          durationSec: isoDurationToSeconds(d.contentDetails?.duration),
+          publishedAt: d.snippet?.publishedAt,
+        };
+      })
+      .filter(Boolean);
+  } catch (e) {
+    console.error('Failed to fetch videos for channel', channelId, e.message);
+    throw e;
+  }
+}
+
+// Track API quota usage
+let apiQuotaUsed = 0;
+let quotaResetTime = now() + 24 * 60 * 60 * 1000; // Reset daily
+const MAX_DAILY_QUOTA = 10000; // YouTube API default quota
+const QUOTA_SAFETY_MARGIN = 1000; // Reserve some quota
+
+function estimateQuotaCost(operation) {
+  const costs = {
+    search: 100,
+    videos: 1,
+    channels: 1
+  };
+  return costs[operation] || 1;
+}
+
+function canMakeApiCall(operation) {
+  if (now() > quotaResetTime) {
+    apiQuotaUsed = 0;
+    quotaResetTime = now() + 24 * 60 * 60 * 1000;
+  }
+  const cost = estimateQuotaCost(operation);
+  return (apiQuotaUsed + cost) < (MAX_DAILY_QUOTA - QUOTA_SAFETY_MARGIN);
+}
+
+function recordQuotaUsage(operation) {
+  apiQuotaUsed += estimateQuotaCost(operation);
+  console.log(`YouTube API quota used: ${apiQuotaUsed}/${MAX_DAILY_QUOTA}`);
 }
 
 async function getAggregatedVideos({ handle }) {
@@ -271,22 +343,54 @@ async function getAggregatedVideos({ handle }) {
     const key = handle.toLowerCase();
     const entry = cache.videosByHandle.get(key);
     if (entry && entry.expires > now()) return entry.data;
-    const channelId = await resolveChannelIdFromHandle(handle);
-    const vids = await fetchRecentVideosForChannel(channelId, 12);
-    const sorted = vids.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
-    const data = { items: sorted, nextCursor: null };
-    cache.videosByHandle.set(key, { data, expires: now() + TTL_VIDEOS });
-    return data;
+    
+    // Check quota before making API calls
+    if (!canMakeApiCall('search') || !canMakeApiCall('videos')) {
+      console.warn('YouTube API quota limit reached, serving stale data if available');
+      if (entry && entry.data) {
+        // Extend cache and serve stale data
+        cache.videosByHandle.set(key, { data: entry.data, expires: now() + TTL_VIDEOS });
+        return entry.data;
+      }
+      return { items: [], nextCursor: null };
+    }
+    
+    try {
+      const channelId = await resolveChannelIdFromHandle(handle);
+      const vids = await fetchRecentVideosForChannel(channelId, 12);
+      const sorted = vids.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
+      const data = { items: sorted, nextCursor: null };
+      cache.videosByHandle.set(key, { data, expires: now() + TTL_VIDEOS });
+      return data;
+    } catch (e) {
+      console.warn('Failed to fetch videos for handle', handle, e.message);
+      // Return stale data if available
+      if (entry && entry.data) return entry.data;
+      return { items: [], nextCursor: null };
+    }
   }
 
   if (cache.videosAll.data && cache.videosAll.expires > now()) return cache.videosAll.data;
 
-  // Fetch top N per channel and merge
+  // Check quota for bulk operation
+  const estimatedCost = CHANNEL_HANDLES.length * (estimateQuotaCost('search') + estimateQuotaCost('videos'));
+  if (apiQuotaUsed + estimatedCost > (MAX_DAILY_QUOTA - QUOTA_SAFETY_MARGIN)) {
+    console.warn('YouTube API quota limit reached, serving stale data if available');
+    if (cache.videosAll.data) {
+      // Extend cache and serve stale data
+      cache.videosAll = { data: cache.videosAll.data, expires: now() + TTL_VIDEOS };
+      return cache.videosAll.data;
+    }
+    return { items: [], nextCursor: null };
+  }
+
+  // Fetch top N per channel and merge with error handling
   const perChannel = await Promise.all(
     CHANNEL_HANDLES.map(async (h) => {
       try {
         const id = await resolveChannelIdFromHandle(h);
-        return await fetchRecentVideosForChannel(id, 6);
+        const videos = await fetchRecentVideosForChannel(id, 6);
+        return videos;
       } catch (e) {
         console.warn('Channel fetch failed', h, e.message);
         return [];
@@ -328,24 +432,82 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // Debug endpoint (remove in production)
 app.get('/debug/youtube', asyncHandler(async (req, res) => {
-  if (!YT_KEY) return res.status(500).json({ error: 'No YouTube API key' });
+  if (!YT_KEY) return res.status(500).json({ error: 'No YouTube API key configured' });
+  
   try {
+    // Check quota status first
+    const quotaStatus = {
+      used: apiQuotaUsed,
+      max: MAX_DAILY_QUOTA,
+      remaining: MAX_DAILY_QUOTA - apiQuotaUsed,
+      resetTime: new Date(quotaResetTime).toISOString(),
+      canMakeCall: canMakeApiCall('search')
+    };
+
+    if (!canMakeApiCall('search')) {
+      return res.json({
+        success: false,
+        error: 'YouTube API quota limit reached',
+        quota: quotaStatus,
+        suggestion: 'Wait for quota reset or increase daily quota limit'
+      });
+    }
+
     // Test basic YouTube API call
     const testUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=1&q=@premierleague&key=${YT_KEY}`;
     const result = await fetchJson(testUrl);
+    recordQuotaUsage('search');
+    
     res.json({ 
       success: true, 
-      quota: 'API responding',
+      quota: quotaStatus,
       channelFound: result.items?.length > 0,
-      result 
+      cacheStatus: {
+        videosAll: cache.videosAll.data ? 'cached' : 'empty',
+        channelsList: cache.channelsList.data ? 'cached' : 'empty',
+        channelIds: cache.channelIdByHandle.size
+      },
+      testResult: result
     });
   } catch (err) {
     res.status(500).json({ 
       error: err.message,
+      quota: {
+        used: apiQuotaUsed,
+        max: MAX_DAILY_QUOTA,
+        remaining: MAX_DAILY_QUOTA - apiQuotaUsed
+      },
       suggestion: 'Check YouTube API key and quota at https://console.cloud.google.com/apis/api/youtube.googleapis.com'
     });
   }
 }));
+
+// Quota status endpoint
+app.get('/debug/quota', (req, res) => {
+  res.json({
+    youtube: {
+      used: apiQuotaUsed,
+      max: MAX_DAILY_QUOTA,
+      remaining: MAX_DAILY_QUOTA - apiQuotaUsed,
+      resetTime: new Date(quotaResetTime).toISOString(),
+      canMakeCall: canMakeApiCall('search')
+    },
+    cache: {
+      videosAll: {
+        hasData: !!cache.videosAll.data,
+        expires: cache.videosAll.expires ? new Date(cache.videosAll.expires).toISOString() : null,
+        itemCount: cache.videosAll.data?.items?.length || 0
+      },
+      channelsList: {
+        hasData: !!cache.channelsList.data,
+        expires: cache.channelsList.expires ? new Date(cache.channelsList.expires).toISOString() : null,
+        itemCount: cache.channelsList.data?.items?.length || 0
+      },
+      channelIds: cache.channelIdByHandle.size,
+      videosByHandle: cache.videosByHandle.size
+    }
+  });
+});
 
 app.get('/videos', [
   query('handle').optional().isString().trim().isLength({ max: 100 }),

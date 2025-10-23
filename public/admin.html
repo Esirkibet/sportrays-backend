@@ -21,18 +21,22 @@
   <h1>Sport Rays Admin</h1>
   <div class="row">
     <label for="secret">Admin Secret:</label>
-    <input id="secret" type="password" placeholder="Enter ADMIN_SECRET" />
+    <input id="secret" type="password" placeholder="Enter ADMIN_SECRET" required />
     <button id="load">Load Polls</button>
+    <button id="testConnection" class="secondary">Test Connection</button>
   </div>
+  <div id="status" style="margin: 10px 0; padding: 8px; border-radius: 4px; display: none;"></div>
 
   <h2>Create Poll</h2>
   <div class="col">
-    <input id="q" placeholder="Question" />
-    <input id="startsAt" type="datetime-local" />
-    <input id="endsAt" type="datetime-local" />
-    <input id="options" placeholder="Options (comma-separated)" />
-    <label class="row"><input id="isActive" type="checkbox" /> Active</label>
-    <button id="create">Create</button>
+    <input id="q" placeholder="Question" required />
+    <label for="startsAt">Start Time:</label>
+    <input id="startsAt" type="datetime-local" required />
+    <label for="endsAt">End Time:</label>
+    <input id="endsAt" type="datetime-local" required />
+    <input id="options" placeholder="Options (comma-separated, min 2)" required />
+    <label class="row"><input id="isActive" type="checkbox" /> Active immediately</label>
+    <button id="create">Create Poll</button>
   </div>
 
   <h2>Polls</h2>
@@ -42,10 +46,28 @@
     const $ = (id) => document.getElementById(id);
     const api = (path, method = 'GET', body) => {
       const secret = $('secret').value.trim();
+      if (!secret && path.includes('/admin/')) {
+        throw new Error('Admin secret is required');
+      }
       const headers = { 'Content-Type': 'application/json', 'x-admin-secret': secret };
-      return fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined }).then(r => {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.headers.get('content-type')?.includes('json') ? r.json() : r.text();
+      console.log(`API ${method} ${path}`, body ? { body } : '');
+      return fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined }).then(async r => {
+        const contentType = r.headers.get('content-type');
+        const responseText = await r.text();
+        console.log(`API Response ${r.status}:`, responseText);
+        
+        if (!r.ok) {
+          let errorMsg = `HTTP ${r.status}`;
+          try {
+            const errorData = JSON.parse(responseText);
+            errorMsg = errorData.error || errorMsg;
+          } catch (e) {
+            errorMsg = responseText || errorMsg;
+          }
+          throw new Error(errorMsg);
+        }
+        
+        return contentType?.includes('json') ? JSON.parse(responseText) : responseText;
       });
     };
 
@@ -91,18 +113,92 @@
     }
 
     $('load').addEventListener('click', loadPolls);
+    
+    $('testConnection').addEventListener('click', async () => {
+      const statusEl = $('status');
+      try {
+        statusEl.style.display = 'block';
+        statusEl.style.background = '#333';
+        statusEl.textContent = 'Testing connection...';
+        
+        const result = await api('/admin/polls');
+        statusEl.style.background = '#0d6627';
+        statusEl.textContent = `Connection successful! Found ${result.items?.length || 0} polls.`;
+      } catch (e) {
+        statusEl.style.background = '#b42318';
+        statusEl.textContent = `Connection failed: ${e.message}`;
+      }
+    });
+    
+    // Auto-fill current time for convenience
+    const now = new Date();
+    const nowStr = now.toISOString().slice(0, 16);
+    const laterStr = new Date(now.getTime() + 60 * 60 * 1000).toISOString().slice(0, 16);
+    $('startsAt').value = nowStr;
+    $('endsAt').value = laterStr;
 
     $('create').addEventListener('click', async () => {
       const question = $('q').value.trim();
-      const startsAt = new Date($('startsAt').value).toISOString();
-      const endsAt = new Date($('endsAt').value).toISOString();
-      const options = $('options').value.split(',').map(s => s.trim()).filter(Boolean);
+      const startsAtValue = $('startsAt').value.trim();
+      const endsAtValue = $('endsAt').value.trim();
+      const optionsValue = $('options').value.trim();
       const isActive = $('isActive').checked;
+      
+      // Basic validation
+      if (!question) {
+        alert('Question is required');
+        return;
+      }
+      
+      if (!startsAtValue || !endsAtValue) {
+        alert('Start and end times are required');
+        return;
+      }
+      
+      if (!optionsValue) {
+        alert('Options are required');
+        return;
+      }
+      
+      const options = optionsValue.split(',').map(s => s.trim()).filter(Boolean);
+      if (options.length < 2) {
+        alert('At least 2 options are required');
+        return;
+      }
+      
+      let startsAt, endsAt;
       try {
-        await api('/admin/polls', 'POST', { question, startsAt, endsAt, isActive, options });
+        startsAt = new Date(startsAtValue).toISOString();
+        endsAt = new Date(endsAtValue).toISOString();
+        
+        // Validate dates
+        if (new Date(startsAt) >= new Date(endsAt)) {
+          alert('End time must be after start time');
+          return;
+        }
+      } catch (e) {
+        alert('Invalid date format');
+        return;
+      }
+      
+      try {
+        console.log('Creating poll:', { question, startsAt, endsAt, isActive, options });
+        const result = await api('/admin/polls', 'POST', { question, startsAt, endsAt, isActive, options });
+        console.log('Poll created:', result);
+        
+        // Clear form
+        $('q').value = '';
+        $('startsAt').value = '';
+        $('endsAt').value = '';
+        $('options').value = '';
+        $('isActive').checked = false;
+        
         await loadPolls();
-        alert('Created');
-      } catch (e) { alert('Failed: ' + e.message); }
+        alert(`Poll created successfully! ID: ${result.pollId}`);
+      } catch (e) { 
+        console.error('Failed to create poll:', e);
+        alert('Failed to create poll: ' + e.message); 
+      }
     });
   </script>
 </body>
