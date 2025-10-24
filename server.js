@@ -64,6 +64,7 @@ app.use('/polls/:id/vote', strictLimiter); // Stricter limit for voting
 
 const PORT = process.env.PORT || 3001;
 const YT_KEY = process.env.YOUTUBE_API_KEY;
+const YT_SCRAPE_FALLBACK = process.env.YOUTUBE_SCRAPE_FALLBACK === 'true';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -217,11 +218,47 @@ async function fetchJson(url, options = {}) {
   }
 }
 
+function extractChannelIdFromHtml(html) {
+  const patterns = [
+    /"channelId":"(UC[\w-]{20,})"/,
+    /"browseId":"(UC[\w-]{20,})"/,
+    /youtube\.com\/channel\/(UC[\w-]{20,})/
+  ];
+  for (const re of patterns) {
+    const m = re.exec(html || '');
+    if (m && m[1]) return m[1];
+  }
+  return null;
+}
+
 async function resolveChannelIdFromHandle(handle) {
   const key = handle.toLowerCase();
   const entry = cache.channelIdByHandle.get(key);
   if (entry && entry.expires > now()) return entry.id;
+  // Try fast HTML scrape first (no API quota) if enabled
+  if (YT_SCRAPE_FALLBACK) {
+    const plain = handle.replace(/^@/, '');
+    try {
+      const res = await fetch(`https://www.youtube.com/@${plain}`, {
+        headers: {
+          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'accept-language': 'en-US,en;q=0.9'
+        }
+      });
+      if (res.ok) {
+        const html = await res.text();
+        const scrapedId = extractChannelIdFromHtml(html);
+        if (scrapedId) {
+          cache.channelIdByHandle.set(key, { id: scrapedId, expires: now() + TTL_CHANNEL_ID });
+          return scrapedId;
+        }
+      }
+    } catch (err) {
+      console.warn('Handle scrape failed', handle, err.message);
+    }
+  }
 
+  // Fallback to API search if quota allows
   if (!canMakeApiCall('search')) {
     console.warn(`Cannot resolve channel ${handle} - quota limit reached`);
     if (entry && entry.id) return entry.id; // Use stale data
@@ -229,11 +266,9 @@ async function resolveChannelIdFromHandle(handle) {
   }
 
   try {
-    // Try YouTube search to find the channel ID by handle
     const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=1&q=${encodeURIComponent(handle)}&key=${YT_KEY}`;
     const json = await fetchJson(url);
     recordQuotaUsage('search');
-    
     const item = json.items?.[0];
     const channelId = item?.id?.channelId;
     if (!channelId) throw new Error(`Cannot resolve channel for handle ${handle}`);
@@ -241,7 +276,6 @@ async function resolveChannelIdFromHandle(handle) {
     return channelId;
   } catch (e) {
     console.error(`Failed to resolve channel ${handle}:`, e.message);
-    // Return stale data if available
     if (entry && entry.id) {
       console.warn(`Using stale channel ID for ${handle}`);
       return entry.id;
@@ -385,18 +419,16 @@ async function getAggregatedVideos({ handle }) {
   }
 
   // Fetch top N per channel and merge with error handling
-  const perChannel = await Promise.all(
-    CHANNEL_HANDLES.map(async (h) => {
-      try {
-        const id = await resolveChannelIdFromHandle(h);
-        const videos = await fetchRecentVideosForChannel(id, 6);
-        return videos;
-      } catch (e) {
-        console.warn('Channel fetch failed', h, e.message);
-        return [];
-      }
-    })
-  );
+  const perChannel = await runWithConcurrency(CHANNEL_HANDLES, 4, async (h) => {
+    try {
+      const id = await resolveChannelIdFromHandle(h);
+      const videos = await fetchRecentVideosForChannel(id, 6);
+      return videos;
+    } catch (e) {
+      console.warn('Channel fetch failed', h, e.message);
+      return [];
+    }
+  });
 
   const merged = perChannel.flat();
   merged.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
@@ -430,7 +462,8 @@ app.get('/', (_req, res) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// Debug endpoint (remove in production)
+// Debug endpoints (disabled in production)
+if (process.env.NODE_ENV !== 'production') {
 app.get('/debug/youtube', asyncHandler(async (req, res) => {
   if (!YT_KEY) return res.status(500).json({ error: 'No YouTube API key configured' });
   
@@ -508,6 +541,7 @@ app.get('/debug/quota', (req, res) => {
     }
   });
 });
+}
 
 app.get('/videos', [
   query('handle').optional().isString().trim().isLength({ max: 100 }),
@@ -517,6 +551,7 @@ app.get('/videos', [
     if (!YT_KEY) return res.status(500).json({ error: 'Server missing YOUTUBE_API_KEY' });
     const handle = req.query.handle;
     const data = await getAggregatedVideos({ handle });
+    res.set('Cache-Control', 'public, max-age=600, stale-while-revalidate=300');
     res.json(data);
   } catch (e) {
     console.error('Videos error:', e.message);
@@ -528,6 +563,7 @@ app.get('/channels', async (_req, res) => {
   try {
     if (!YT_KEY) return res.status(500).json({ error: 'Server missing YOUTUBE_API_KEY' });
     const data = await getChannelsList();
+    res.set('Cache-Control', 'public, max-age=21600'); // 6 hours
     res.json(data);
   } catch (e) {
     console.error(e);
@@ -624,6 +660,7 @@ async function aggregateNews() {
 app.get('/news', async (_req, res) => {
   try {
     const data = await aggregateNews();
+    res.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=300');
     res.json(data);
   } catch (e) {
     console.error(e);
@@ -743,6 +780,8 @@ app.get('/scores', [
     const scope = (req.query.scope || 'live').toString();
     if (!['live', 'today', 'upcoming'].includes(scope)) return res.status(400).json({ error: 'bad scope' });
     const data = await getScores(scope);
+    const cacheSeconds = scope === 'live' ? 30 : scope === 'today' ? 60 : 300;
+    res.set('Cache-Control', `public, max-age=${cacheSeconds}`);
     res.json(data);
   } catch (e) {
     console.error('Scores error:', e.message);
